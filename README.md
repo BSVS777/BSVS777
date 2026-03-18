@@ -43,7 +43,7 @@ I am currently a Software Engineering student at UTN, based in Costa Rica. I'm c
 ### 📊 My GitHub Activity
 
 <div align="center">
-  <img src="https://github-readme-stats.vercel.app/api?username=BSVS777&show_icons=true&theme=transparent&hide_border=true&title_color=white&text_color=a6a6a6&icon_color=58A6FF" alt="GitHub Stats" />
+  <img src="github-metrics.svg" alt="GitHub Metrics" width="100%" />
 </div>
 
 <br />
