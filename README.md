@@ -54,7 +54,4 @@ I am currently a Software Engineering student at UTN, based in Costa Rica. I'm c
   <a href="www.linkedin.com/in/bernal-vargas-solís-98022427a">
     <img src="https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"/>
   </a>
-  <a href="mailto:bsvs2525@gmail.com">
-    <img src="https://img.shields.io/badge/Email-D14836?style=for-the-badge&logo=gmail&logoColor=white" alt="Email"/>
-  </a>
 </p>
