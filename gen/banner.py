@@ -169,6 +169,137 @@ def runs_path(xs, ys) -> str:
     return "".join(parts)
 
 
+# ---------------------------------------------------------------- loop
+
+LOGO_BOX = 250        # grid cells a logo may occupy (square)
+N_TRAVEL = 1300
+N_BANDS = 94
+DRIFT = 0.42
+BAND_NOISE = 4.0      # per-dot noise before grouping; avoids the square-grid trap
+T_PORTRAIT, T_LOGO, T_MOVE = 3.0, 2.0, 1.3
+LOOP = T_PORTRAIT + 3 * T_LOGO + 4 * T_MOVE
+INTRO_END = INTRO_SPREAD + INTRO_FADE
+
+
+def loop_key_times() -> str:
+    t, ks = 0.0, [0.0]
+    for step in (T_PORTRAIT, T_MOVE, T_LOGO, T_MOVE, T_LOGO, T_MOVE, T_LOGO, T_MOVE):
+        t += step
+        ks.append(t / LOOP)
+    return ";".join(f"{k:.4f}" for k in ks)
+
+
+KEY_SPLINES = ";".join(["0.45 0 0.2 1"] * 8)
+
+
+def repair_ts(m: np.ndarray) -> np.ndarray:
+    """The reference sheet's 'S' is half opaque; re-cut it as a bold S matched to the T."""
+    from PIL import ImageDraw, ImageFont
+    filled = ndimage.binary_fill_holes(m)
+    lab, n = ndimage.label(filled & ~m)
+    sizes = ndimage.sum(np.ones_like(lab), lab, range(1, n + 1))
+    t_lab = 1 + int(np.argmax(sizes))
+    ys, xs = np.nonzero(lab == t_lab)
+    ty0, ty1, tx1 = ys.min(), ys.max(), xs.max()
+    m = m | (filled & (lab != t_lab))            # drop the broken S remnants
+    cap = ty1 - ty0 + 1
+    font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", int(cap * 1.38))
+    glyph = Image.new("L", m.shape[::-1])
+    d = ImageDraw.Draw(glyph)
+    bx0, by0, bx1, by1 = d.textbbox((0, 0), "S", font=font)
+    d.text((tx1 + cap * 0.10 - bx0, ty0 - by0 + (cap - (by1 - by0)) / 2), "S", font=font, fill=255)
+    return m & ~(np.asarray(glyph) > 127)
+
+
+def load_logos(path: Path) -> list[np.ndarray]:
+    """Split the reference sheet into logos by empty columns; skip the first (the 25)."""
+    rgba = np.asarray(Image.open(path).convert("RGBA")).astype(int)
+    # the sheet is transparent where the logos are "white": alpha is the only
+    # reliable signal, the RGB under transparent pixels is leftover noise
+    blue = (rgba[..., 3] > 128) & ((rgba[..., 2] - rgba[..., 0]) > 40)
+    cols = np.nonzero(blue.any(axis=0))[0]
+    cuts = np.nonzero(np.diff(cols) > 10)[0]
+    starts = np.r_[cols[0], cols[cuts + 1]]
+    ends = np.r_[cols[cuts], cols[-1]]
+    masks = []
+    for k, (x0, x1) in enumerate(list(zip(starts, ends))[-3:]):
+        m = blue[:, x0:x1 + 1].copy()
+        if k == 2:
+            m = repair_ts(m)
+        ys = np.nonzero(m.any(axis=1))[0]
+        m = m[ys[0]:ys[-1] + 1]
+        s = LOGO_BOX / max(m.shape)
+        size = (max(1, round(m.shape[1] * s)), max(1, round(m.shape[0] * s)))
+        small = np.asarray(Image.fromarray(m.astype(np.uint8) * 255).resize(size, Image.LANCZOS)) > 127
+        grid = np.zeros((GH, GW), bool)
+        ox, oy = (GW - size[0]) // 2, (GH - size[1]) // 2
+        grid[oy:oy + size[1], ox:ox + size[0]] = small
+        masks.append(grid)
+    return masks
+
+
+def _poisson(cands: np.ndarray, r: float) -> np.ndarray:
+    """Greedy blue-noise: accept candidates in order if no accepted point within r."""
+    blocked = np.zeros((GH, GW), bool)
+    ri = int(np.ceil(r))
+    yy, xx = np.mgrid[-ri:ri + 1, -ri:ri + 1]
+    disk = (xx ** 2 + yy ** 2) < r * r
+    keep = []
+    for y, x in cands:
+        if blocked[y, x]:
+            continue
+        keep.append((x, y))
+        y0, y1, x0, x1 = max(0, y - ri), min(GH, y + ri + 1), max(0, x - ri), min(GW, x + ri + 1)
+        blocked[y0:y1, x0:x1] |= disk[y0 - y + ri:y1 - y + ri, x0 - x + ri:x1 - x + ri]
+    return np.array(keep, float) + 0.5
+
+
+def sample_points(mask: np.ndarray, n: int, rng) -> np.ndarray:
+    """Exactly n evenly spaced points; outline (incl. holes) first so glyphs stay legible."""
+    edge = mask & ~ndimage.binary_erosion(mask, iterations=1)
+    e = np.argwhere(edge)
+    i = np.argwhere(mask & ~edge)
+    cands = np.r_[e[rng.permutation(len(e))], i[rng.permutation(len(i))]]
+    lo, hi = 1.0, 20.0
+    for _ in range(25):  # bisect the spacing radius to land just above n points
+        r = (lo + hi) / 2
+        if len(_poisson(cands, r)) >= n:
+            lo = r
+        else:
+            hi = r
+    pts = _poisson(cands, lo)
+    return pts[rng.choice(len(pts), n, replace=False)]
+
+
+def match(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Optimal transport (assignment): reorder dst so dst[i] is src[i]'s target."""
+    from scipy.optimize import linear_sum_assignment
+    cost = ((src[:, None, :] - dst[None, :, :]) ** 2).sum(-1)
+    _, cols = linear_sum_assignment(cost)
+    return dst[cols]
+
+
+def drift_bands(xs, ys, rng, noise=BAND_NOISE):
+    from scipy.cluster.vq import kmeans2
+    pts = np.c_[xs, ys].astype(float)
+    noisy = pts + rng.normal(0, noise, pts.shape) if noise else pts
+    _, labels = kmeans2(noisy, N_BANDS, seed=SEED, minit="++")
+    return labels
+
+
+def straight_boundary(xs, ys, labels) -> float:
+    """Share of band-boundary cells that continue straight for 3 cells (0.01 organic, 0.17 grid)."""
+    lab = np.full((GH, GW), -1)
+    lab[ys, xs] = labels
+    hits = total = 0
+    for a in (lab, lab.T):
+        both = (a[:, :-1] >= 0) & (a[:, 1:] >= 0)
+        b = both & (a[:, :-1] != a[:, 1:])
+        total += b.sum()
+        hits += (b[1:-1] & b[:-2] & b[2:]).sum()
+    return float(hits / max(total, 1))
+
+
 # ---------------------------------------------------------------- svg
 
 FONT = "ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace"
@@ -185,7 +316,7 @@ def info_row(x, y, width, label, value, t):
             f'<tspan fill="{t["text"]}">{value}</tspan></text>')
 
 
-def build_svg(theme: str, xs, ys, g, begins) -> str:
+def build_svg(theme: str, xs, ys, g, begins, loop) -> str:
     t = THEMES[theme]
     fx, fy, fw, fh = 34, 62, 424, 524
     px = fx + (fw - GW * CELL) / 2
@@ -213,12 +344,45 @@ def build_svg(theme: str, xs, ys, g, begins) -> str:
                f'fill="{t["dim"]}">{GW}x{GH} · 1-bit</text>')
     out.append(f'<g transform="translate({px:.1f} {py:.1f}) scale({CELL})" '
                f'fill="{t["portrait"]}" shape-rendering="crispEdges">')
+    # intro layer: plays once, then hands over to the loop layer
+    out.append('<g>')
     for k in np.argsort(begins):
         sel = g == k
         out.append(f'<path opacity="0" d="{runs_path(xs[sel], ys[sel])}">'
                    f'<animate attributeName="opacity" from="0" to="1" '
                    f'begin="{begins[k]:.2f}s" dur="{INTRO_FADE}s" fill="freeze"/></path>')
+    out.append(f'<set attributeName="visibility" to="hidden" begin="{INTRO_END}s" fill="freeze"/></g>')
+
+    # loop layer 1: portrait drift bands
+    timing = (f'dur="{LOOP}s" begin="{INTRO_END}s" repeatCount="indefinite" '
+              f'keyTimes="{loop_key_times()}"')
+    spline = f'calcMode="spline" keySplines="{KEY_SPLINES}"'
+    out.append(f'<g visibility="hidden"><set attributeName="visibility" to="visible" '
+               f'begin="{INTRO_END}s" fill="freeze"/>')
+    labels, drifts = loop["labels"], loop["drifts"]
+    for b in range(N_BANDS):
+        sel = labels == b
+        if not sel.any():
+            continue
+        dx, dy = drifts[b]
+        d = f"{dx:.1f} {dy:.1f}"
+        out.append(f'<path d="{runs_path(xs[sel], ys[sel])}">'
+                   f'<animateTransform attributeName="transform" type="translate" '
+                   f'values="0 0;0 0;{";".join([d] * 6)};0 0" {timing} {spline}/>'
+                   f'<animate attributeName="opacity" values="1;1;0;0;0;0;0;0;1" {timing}/></path>')
     out.append('</g>')
+
+    # loop layer 2: travellers morphing between logos
+    out.append(f'<g opacity="0" shape-rendering="auto"><animate attributeName="opacity" '
+               f'values="0;0;1;1;1;1;1;1;0" {timing}/>')
+    P, L1, L2, L3 = loop["paths"]
+    for i in range(len(P)):
+        stops = [P[i], P[i], L1[i], L1[i], L2[i], L2[i], L3[i], L3[i], P[i]]
+        vals = ";".join(f"{x:.1f} {y:.1f}" for x, y in stops)
+        out.append(f'<rect x="-0.8" y="-0.8" width="1.6" height="1.6">'
+                   f'<animateTransform attributeName="transform" type="translate" '
+                   f'values="{vals}" {timing} {spline}/></rect>')
+    out.append('</g></g>')
 
     # info panel
     ix, iw = 492, 650
@@ -263,8 +427,29 @@ def main():
     xs, ys, g, begins = intro_groups(dots)
     print(f"dots={dots.sum()}  coverage={dots.sum() / mask.sum():.2f}  "
           f"evenness@1.2s={evenness(xs, ys, g, begins):.3f}")
+
+    rng = np.random.default_rng(SEED)
+    logos = load_logos(ROOT / "gen" / "logos.webp")
+    P = sample_points(mask, N_TRAVEL, rng)
+    L1 = match(P, sample_points(logos[0], N_TRAVEL, rng))
+    L2 = match(L1, sample_points(logos[1], N_TRAVEL, rng))
+    L3 = match(L2, sample_points(logos[2], N_TRAVEL, rng))
+    np.save(DATA / "travellers.npy", np.stack([P, L1, L2, L3]))
+    labels = drift_bands(xs, ys, rng)
+    np.save(DATA / "bands.npy", labels)
+    c1 = L1.mean(axis=0)
+    drifts = np.zeros((N_BANDS, 2))
+    for b in range(N_BANDS):
+        sel = labels == b
+        if sel.any():
+            drifts[b] = DRIFT * (c1 - np.c_[xs[sel], ys[sel]].mean(axis=0))
+    grid_labels = drift_bands(xs, ys, np.random.default_rng(SEED), noise=0)
+    print(f"straight-boundary: noisy={straight_boundary(xs, ys, labels):.3f}  "
+          f"no-noise={straight_boundary(xs, ys, grid_labels):.3f}  loop={LOOP:.1f}s")
+    loop = dict(labels=labels, drifts=drifts, paths=(P, L1, L2, L3))
+
     for theme in THEMES:
-        svg = build_svg(theme, xs, ys, g, begins)
+        svg = build_svg(theme, xs, ys, g, begins, loop)
         (ROOT / f"{theme}.svg").write_text(svg, encoding="utf-8")
         print(f"{theme}.svg {len(svg.encode()) / 1024:.0f} KB")
 
